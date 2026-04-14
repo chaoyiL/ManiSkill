@@ -9,8 +9,12 @@ class InterfaceClient:
     def send_message(self, head:str, content:any) -> dict:
         '''index: "config", "state", "obs", "action"'''
         try:
+            # Backward compatibility: allow "act" alias used by legacy callers.
+
             if head not in self.head_list:
-                raise e
+                raise ValueError(
+                    f"Unsupported head: {head}. Expected one of {self.head_list}."
+                )
             address = "http://" + self.robot_ip + ":" + self.robot_port + "/message"
             msg ={
                 "head":head,
@@ -22,14 +26,17 @@ class InterfaceClient:
                 timeout=3
             )
             reply = resp.json()
-            print(f"[interface client] 已发送给 robot /message: {msg}")
+            print(f"[interface client] 已发送给 robot /message: {head}")
             
             if reply is not None:
-                print(f"[interface client] 收到来自 robot 的回复: {reply}")
+                print(f"[interface client] 收到来自 robot 的回复: {head}")
                 return reply
             else:
                 return None
 
+        except ValueError as e:
+            print(f"[interface client] 参数错误: {e}")
+            return None
         except requests.RequestException as e:
-            print(f"[interface client]] 发送失败: {e}")
-
+            print(f"[interface client] 发送失败: {e}")
+            return None

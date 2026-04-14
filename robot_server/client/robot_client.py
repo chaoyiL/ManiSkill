@@ -30,7 +30,7 @@ class RobotClient:
     def _handle_message(self, data: dict):
         head = data["head"]
         content = data["content"]
-        print(f"[robot client] HEAD {head} 收到消息 {content}")
+        print(f"[robot client] HEAD {head} 收到消息")
 
         with self._lock:
             if head == "config":

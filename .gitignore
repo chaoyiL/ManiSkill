@@ -20,6 +20,9 @@ venv/
 # Logs
 *.log
 
+# Evaluation observation dumps
+**/eval_obs_data/
+
 # Large local model checkpoints (not suitable for regular Git)
 robot_server/policy/tactile_ssl/checkpoints/sparsh_x_img/d360_sparshx_img_base.pth
 user_client/policy/tactile_ssl/checkpoints/sparsh_x_img/d360_sparshx_img_base.pth

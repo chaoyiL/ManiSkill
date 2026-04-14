@@ -27,6 +27,50 @@ from openpi.policies import policy_config
 from utils.precise_sleep import precise_wait
 from client.interface_client import InterfaceClient
 
+def convert_list_to_ndarray(obj: Any, key_path: str = "") -> Any:
+    """Recursively convert obs_dict lists to ndarray with inference-safe dtypes."""
+    if isinstance(obj, dict):
+        return {
+            k: convert_list_to_ndarray(v, k if not key_path else f"{key_path}.{k}")
+            for k, v in obj.items()
+        }
+
+    if isinstance(obj, list):
+        converted = [convert_list_to_ndarray(item, key_path) for item in obj]
+
+        # Keep image payload as uint8 so Observation.from_dict can normalize to [-1, 1].
+        if key_path.startswith("observation.images."):
+            return np.asarray(converted, dtype=np.uint8)
+
+        # Robot state is expected as float.
+        if key_path == "observation.state":
+            return np.asarray(converted, dtype=np.float32)
+
+        arr = np.asarray(converted)
+        if arr.dtype == np.object_:
+            return arr
+        if np.issubdtype(arr.dtype, np.floating):
+            return arr.astype(np.float32, copy=False)
+        if np.issubdtype(arr.dtype, np.integer):
+            return arr.astype(np.int32, copy=False)
+        return arr
+
+    if isinstance(obj, tuple):
+        return tuple(convert_list_to_ndarray(item, key_path) for item in obj)
+
+    return obj
+
+def convert_ndarray_to_list(obj: Any) -> Any:
+    """Recursively convert numpy arrays in obs dict to Python lists before sending."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: convert_ndarray_to_list(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [convert_ndarray_to_list(item) for item in obj]
+    return obj
 
 class ObsSaver:
     """异步保存observation数据，不影响eval过程"""
@@ -228,8 +272,11 @@ def main(config,
         respose = client.send_message("config", config_dict)
         time.sleep(1)
 
+    arm_num = None
     if single_arm_mode:
-        cam_path = [cam_path[0]]
+        arm_num = 1
+    else:
+        arm_num = 2
 
     print("steps_per_inference:", steps_per_inference)
     print("jax backend:", jax.default_backend())
@@ -248,22 +295,23 @@ def main(config,
             print("[main] waiting for obs...")
             obs_dict = client.send_message("obs", content="obs request")
             time.sleep(1)
+        obs_dict = convert_list_to_ndarray(obs_dict)
         
         # calculate raw action and send it to robot
         result = policy.infer(obs_dict)
         raw_action = result['actions']
-        assert raw_action.shape[-1] == 10 * len(cam_path)
+        assert raw_action.shape[-1] == 10 * arm_num
 
         print('################################## Ready! ##################################')
         input("press enter to con...")
         client.send_message("state", content="start")
 
-        obs_saver = None
-        if save_obs:
-            obs_save_dir = os.path.join(ROOT_DIR, "eval_obs_data")
-            obs_saver = ObsSaver(obs_save_dir, data_type)
-            obs_saver.start()
-            print(f"[ObsSaver] Observation saving enabled. Directory: {obs_saver.save_dir}")
+        # obs_saver = None
+        # if save_obs:
+        #     obs_save_dir = os.path.join(ROOT_DIR, "eval_obs_data")
+        #     obs_saver = ObsSaver(obs_save_dir, data_type)
+        #     obs_saver.start()
+        #     print(f"[ObsSaver] Observation saving enabled. Directory: {obs_saver.save_dir}")
 
         try:
 
@@ -282,7 +330,8 @@ def main(config,
                         obs_dict = None
                         while obs_dict is None:
                             obs_dict = client.send_message("obs", content="obs request")
-                            time.sleep(0.1)
+                            time.sleep(0.01)
+                        obs_dict = convert_list_to_ndarray(obs_dict)
 
                         # 保存obs
                         # if obs_saver is not None:
@@ -292,8 +341,8 @@ def main(config,
                         result = policy.infer(obs_dict)
 
                         # 将输出的相对动作转换成绝对动作
-                        raw_action = result['actions']
-                        client.send_message("act", content=raw_action)
+                        raw_action = convert_ndarray_to_list(result['actions'])
+                        client.send_message("action", content=raw_action)
                         print("[main] 已发送action!")
 
                         counter += 1
@@ -306,9 +355,10 @@ def main(config,
                     break
 
         finally:
+            pass
             # stop obs saver
-            if obs_saver is not None:
-                obs_saver.stop()
+            # if obs_saver is not None:
+            #     obs_saver.stop()
 
 if __name__ == '__main__':
     main()
