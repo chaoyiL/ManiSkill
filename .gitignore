@@ -1,0 +1,25 @@
+.codex
+.DS_Store
+
+# Editors
+.vscode/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+**/.venv/
+
+# Logs
+*.log
+
+# Large local model checkpoints (not suitable for regular Git)
+robot_server/policy/tactile_ssl/checkpoints/sparsh_x_img/d360_sparshx_img_base.pth
+user_client/policy/tactile_ssl/checkpoints/sparsh_x_img/d360_sparshx_img_base.pth
