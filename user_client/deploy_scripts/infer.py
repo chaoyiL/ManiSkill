@@ -1,7 +1,6 @@
 from math import ceil
 import sys
 import os
-from typing import Any
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 sys.path.append(ROOT_DIR)
@@ -26,51 +25,6 @@ from openpi.training import config as _config
 from openpi.policies import policy_config
 from utils.precise_sleep import precise_wait
 from client.interface_client import InterfaceClient
-
-def convert_list_to_ndarray(obj: Any, key_path: str = "") -> Any:
-    """Recursively convert obs_dict lists to ndarray with inference-safe dtypes."""
-    if isinstance(obj, dict):
-        return {
-            k: convert_list_to_ndarray(v, k if not key_path else f"{key_path}.{k}")
-            for k, v in obj.items()
-        }
-
-    if isinstance(obj, list):
-        converted = [convert_list_to_ndarray(item, key_path) for item in obj]
-
-        # Keep image payload as uint8 so Observation.from_dict can normalize to [-1, 1].
-        if key_path.startswith("observation.images."):
-            return np.asarray(converted, dtype=np.uint8)
-
-        # Robot state is expected as float.
-        if key_path == "observation.state":
-            return np.asarray(converted, dtype=np.float32)
-
-        arr = np.asarray(converted)
-        if arr.dtype == np.object_:
-            return arr
-        if np.issubdtype(arr.dtype, np.floating):
-            return arr.astype(np.float32, copy=False)
-        if np.issubdtype(arr.dtype, np.integer):
-            return arr.astype(np.int32, copy=False)
-        return arr
-
-    if isinstance(obj, tuple):
-        return tuple(convert_list_to_ndarray(item, key_path) for item in obj)
-
-    return obj
-
-def convert_ndarray_to_list(obj: Any) -> Any:
-    """Recursively convert numpy arrays in obs dict to Python lists before sending."""
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, dict):
-        return {k: convert_ndarray_to_list(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [convert_ndarray_to_list(item) for item in obj]
-    return obj
 
 class ObsSaver:
     """异步保存observation数据，不影响eval过程"""
@@ -218,19 +172,19 @@ class ObsSaver:
 
 @click.command()
 @click.option('--config', '-c', default=f'pi05_bi_vitac', help='Config name for policy.')
-@click.option('--ckpt-dir', '-i', default='/home/rvsa/codehub/VB-VLA/checkpoints/pi05_bi_vitac/my_experiment/40000', help='Path to checkpoint directory')
+@click.option('--ckpt-dir', '-i', default='/home/rvsa/codehub/ManiSkill/user_client/checkpoint/pi05_bi_vitac/my_experiment/35000', help='Path to checkpoint directory')
 @click.option('--data_type', '-dt', default='vitac',help='vision, vitac, vitacpc')
 @click.option('--language_prompt', '-lp', default='Open the red pot, pick up the blue cylinder on the table and place it into the pot.', help='Language prompt')
 
-@click.option('--save_obs', '-so', default=True, help='Save observation data for verification (saves every step)')
-@click.option('--control_frequency', '-f', default=10, type=float, help="Control frequency in Hz.")
+@click.option('--save_obs', '-so', default=False, help='Save observation data for verification (saves every step)')
+@click.option('--control_frequency', '-f', default=5, type=float, help="Control frequency in Hz.")
 @click.option('--controller_frequency', '-cf', default=80, type=float, help="Controller frequency in Hz.")
 
 @click.option('--single_arm_mode', default=False, help='single arm mode')
 @click.option('--no_state_obs_mode', default=False, help='no state obs mode')
 
-@click.option('--ip', default='127.0.0.1', help='ip of robot')
-@click.option('--port', default='8000', help='port of robot')
+@click.option('--ip', default='127.0.0.1', help='which ip the messages are sent to')
+@click.option('--port', default='8000', help='port')
 
 def main(config,
     ckpt_dir,
@@ -250,8 +204,9 @@ def main(config,
     if not checkpoint_dir.is_absolute():
         checkpoint_dir = (Path(ROOT_DIR) / checkpoint_dir).resolve()
     policy = policy_config.create_trained_policy(train_config, checkpoint_dir)
-    steps_per_inference = 1 #使用temporal ensembling后，steps_per_inference = 1
+    # steps_per_inference = 1 #使用temporal ensembling后，steps_per_inference = 1
     action_horizon = int(train_config.model.action_horizon)
+    steps_per_inference = action_horizon
 
     client = InterfaceClient(ip, port)
 
@@ -266,11 +221,7 @@ def main(config,
         "action_horizon" : action_horizon
     }
 
-    respose = None
-    while respose == None:
-        print("[main] waiting for robot response")
-        respose = client.send_message("config", config_dict)
-        time.sleep(1)
+    client.send_config(config_dict)
 
     arm_num = None
     if single_arm_mode:
@@ -289,76 +240,46 @@ def main(config,
         print("Warming up policy inference")
 
         policy.reset()
-        # get obs from robot
-        obs_dict = None
-        while obs_dict is None:
-            print("[main] waiting for obs...")
-            obs_dict = client.send_message("obs", content="obs request")
-            time.sleep(1)
-        obs_dict = convert_list_to_ndarray(obs_dict)
-        
+        obs_seq, obs_dict = client.recv_obs()
+
         # calculate raw action and send it to robot
         result = policy.infer(obs_dict)
         raw_action = result['actions']
         assert raw_action.shape[-1] == 10 * arm_num
 
         print('################################## Ready! ##################################')
-        input("press enter to con...")
-        client.send_message("state", content="start")
-
-        # obs_saver = None
-        # if save_obs:
-        #     obs_save_dir = os.path.join(ROOT_DIR, "eval_obs_data")
-        #     obs_saver = ObsSaver(obs_save_dir, data_type)
-        #     obs_saver.start()
-        #     print(f"[ObsSaver] Observation saving enabled. Directory: {obs_saver.save_dir}")
+        input("press enter to start...")
+        client.send_state("start")
 
         try:
-
-            counter = 0
+            policy.reset()
+            last_status_log_time = time.monotonic()
+            iter_idx = 0
 
             while True:
-                try:
-                    policy.reset()
-                    start_delay = 1.0
-                    t_start = time.monotonic() + start_delay
-                    print("Started!")
-                    iter_idx = 0
+                obs_seq, obs_dict = client.recv_obs()
 
-                    while True:
-                        # 不断请求obs直到机器人返回
-                        obs_dict = None
-                        while obs_dict is None:
-                            obs_dict = client.send_message("obs", content="obs request")
-                            time.sleep(0.01)
-                        obs_dict = convert_list_to_ndarray(obs_dict)
+                infer_start = time.monotonic()
+                result = policy.infer(obs_dict)
+                infer_elapsed = time.monotonic() - infer_start
 
-                        # 保存obs
-                        # if obs_saver is not None:
-                        #     obs_saver.save_obs(obs, step_idx=iter_idx)
+                client.send_action(result['actions'], obs_seq=obs_seq)
 
-                        # 根据最新一帧的obs_dict进行推理
-                        result = policy.infer(obs_dict)
+                now = time.monotonic()
+                if now - last_status_log_time >= 2.0:
+                    print(
+                        f"[main] iter={iter_idx} obs_seq={obs_seq} "
+                        f"infer_time_ms={infer_elapsed * 1000.0:.1f}"
+                    )
+                    last_status_log_time = now
 
-                        # 将输出的相对动作转换成绝对动作
-                        raw_action = convert_ndarray_to_list(result['actions'])
-                        client.send_message("action", content=raw_action)
-                        print("[main] 已发送action!")
+                iter_idx += 1
 
-                        counter += 1
-                        if counter > 100000:
-                            break
-
-                except KeyboardInterrupt:
-                    print("Interrupted!")
-                    client.send_message("state",content="stop")
-                    break
-
+        except KeyboardInterrupt:
+            print("Interrupted!")
+            client.send_state("stop")
         finally:
-            pass
-            # stop obs saver
-            # if obs_saver is not None:
-            #     obs_saver.stop()
+            client.close()
 
 if __name__ == '__main__':
     main()

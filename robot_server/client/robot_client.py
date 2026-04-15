@@ -1,63 +1,125 @@
+from __future__ import annotations
+
 import threading
+import time
+from collections import deque
 from typing import Any
 
-import uvicorn
-from fastapi import FastAPI
+from openpi_client import msgpack_numpy
+from websockets.exceptions import ConnectionClosed
+from websockets.sync.server import Server, ServerConnection, serve
 
 
 class RobotClient:
+    """Persistent websocket bridge between robot-side control and remote policy."""
+
     def __init__(self, host: str = "127.0.0.1", port: int = 8000):
         self.host = host
         self.port = port
 
-        self.app = FastAPI()
-        self._lock = threading.Lock()
-        self._server: uvicorn.Server | None = None
+        self._condition = threading.Condition()
+        self._packer = msgpack_numpy.Packer()
+        self._server: Server | None = None
         self._thread: threading.Thread | None = None
+        self._stopped = False
+        self._connected = False
 
-        self.config: Any = None
-        self.state: Any = None
-        self.obs: Any = None
-        self.action: Any = None
+        self._config: Any = None
+        self._state_updates: deque[Any] = deque()
 
-        self._register_routes()
+        self._latest_obs: dict[str, Any] | None = None
+        self._latest_obs_seq = -1
 
-    def _register_routes(self) -> None:
-        @self.app.post("/message")
-        def receive_message(data: dict):
-            return self._handle_message(data)
+        self._latest_action: Any = None
+        self._latest_action_obs_seq = -1
 
-    def _handle_message(self, data: dict):
-        head = data["head"]
-        content = data["content"]
-        print(f"[robot client] HEAD {head} 收到消息")
+    def _handle_connection(self, websocket: ServerConnection) -> None:
+        with self._condition:
+            self._connected = True
+            self._condition.notify_all()
 
-        with self._lock:
-            if head == "config":
-                self.config = content
-                response = {
-                    "content":"get"
-                }
-                return response
-            if head == "state":
-                self.state = content
-                return None
-            if head == "obs":
-                return self.obs
-            if head == "action":
-                self.action = content
-                return None
+        last_sent_obs_seq = -1
 
-        return {"error": f"unknown head: {head}"}
+        try:
+            websocket.send(
+                self._packer.pack(
+                    {
+                        "type": "hello",
+                        "protocol": "robot-bridge-v1",
+                    }
+                )
+            )
+
+            while True:
+                outbound = None
+                with self._condition:
+                    if self._stopped:
+                        break
+                    if self._latest_obs is not None and self._latest_obs_seq > last_sent_obs_seq:
+                        outbound = self._latest_obs
+
+                if outbound is not None:
+                    websocket.send(self._packer.pack(outbound))
+                    last_sent_obs_seq = int(outbound["obs_seq"])
+
+                try:
+                    raw_message = websocket.recv(timeout=0.05)
+                except TimeoutError:
+                    continue
+
+                if isinstance(raw_message, str):
+                    raise RuntimeError("Robot bridge expects binary websocket frames.")
+
+                message = msgpack_numpy.unpackb(raw_message)
+                self._handle_message(message)
+        except ConnectionClosed:
+            pass
+        finally:
+            with self._condition:
+                self._connected = False
+                self._latest_action = None
+                self._latest_action_obs_seq = -1
+                self._condition.notify_all()
+
+    def _handle_message(self, message: dict[str, Any]) -> None:
+        message_type = message.get("type")
+
+        with self._condition:
+            if message_type == "config":
+                self._config = message["config"]
+            elif message_type == "state":
+                self._state_updates.append(message["state"])
+            elif message_type == "action":
+                self._latest_action = message["action"]
+                self._latest_action_obs_seq = int(message["obs_seq"])
+            else:
+                raise ValueError(f"Unsupported websocket message type: {message_type}")
+
+            self._condition.notify_all()
 
     def run(self) -> None:
-        config = uvicorn.Config(self.app, host=self.host, port=self.port)
-        self._server = uvicorn.Server(config)
-        self._server.run()
+        with serve(
+            self._handle_connection,
+            host=self.host,
+            port=self.port,
+            compression=None,
+            max_size=None,
+            # This bridge can legitimately spend long periods inside blocking
+            # policy inference or user input before the next recv() call.
+            # Disable websocket keepalive to avoid false timeouts on the sync API.
+            ping_interval=None,
+        ) as server:
+            with self._condition:
+                self._server = server
+                self._condition.notify_all()
+            server.serve_forever()
 
     def start_background(self, daemon: bool = True) -> threading.Thread:
         if self._thread is not None and self._thread.is_alive():
             return self._thread
+
+        with self._condition:
+            self._stopped = False
 
         self._thread = threading.Thread(
             target=self.run,
@@ -68,19 +130,70 @@ class RobotClient:
         return self._thread
 
     def stop(self) -> None:
-        if self._server is not None:
-            self._server.should_exit = True
+        with self._condition:
+            self._stopped = True
+            server = self._server
+            self._condition.notify_all()
+
+        if server is not None:
+            server.shutdown()
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
-    def get_value(self, name: str) -> Any:
-        with self._lock:
-            ans = getattr(self, name)
-            setattr(self, name, None) # 获得值后立刻复位成None
-            return ans
+    def wait_for_connection(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
 
-    def set_obs(self, obs: Any) -> None:
-        with self._lock:
-            self.obs = obs
+        with self._condition:
+            while not self._connected and not self._stopped:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return self._connected
+
+    def wait_for_config(self, timeout: float | None = None) -> Any:
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        with self._condition:
+            while self._config is None and not self._stopped:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+            return self._config
+
+    def get_state_update(self) -> Any:
+        with self._condition:
+            if self._state_updates:
+                return self._state_updates.popleft()
+            return None
+
+    def publish_obs(self, obs: Any) -> int:
+        with self._condition:
+            self._latest_obs_seq += 1
+            self._latest_obs = {
+                "type": "obs",
+                "obs_seq": self._latest_obs_seq,
+                "obs": obs,
+            }
+            self._condition.notify_all()
+            return self._latest_obs_seq
+
+    def wait_for_action(self, obs_seq: int, timeout: float | None = None) -> Any:
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        with self._condition:
+            while not self._stopped:
+                if self._latest_action is not None and self._latest_action_obs_seq >= obs_seq:
+                    action = self._latest_action
+                    self._latest_action = None
+                    return action
+
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return None
+                self._condition.wait(remaining)
+
+        return None

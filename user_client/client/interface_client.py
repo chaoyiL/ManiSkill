@@ -1,42 +1,82 @@
-import requests
+from __future__ import annotations
+
+import time
+from typing import Any
+
+from openpi_client import msgpack_numpy
+from websockets.sync.client import ClientConnection, connect
+
 
 class InterfaceClient:
-    def __init__(self, ip="127.0.0.1", port="8000"):
+    """Persistent websocket client for remote robot interaction."""
+
+    def __init__(self, ip: str = "127.0.0.1", port: str | int = "8000"):
         self.robot_ip = ip
-        self.robot_port = port
-        self.head_list = ["config", "state", "obs", "action"]
-    
-    def send_message(self, head:str, content:any) -> dict:
-        '''index: "config", "state", "obs", "action"'''
-        try:
-            # Backward compatibility: allow "act" alias used by legacy callers.
+        self.robot_port = int(port)
+        self._uri = f"ws://{self.robot_ip}:{self.robot_port}"
+        self._packer = msgpack_numpy.Packer()
+        self._ws = self._connect()
+        self._expect_hello()
 
-            if head not in self.head_list:
-                raise ValueError(
-                    f"Unsupported head: {head}. Expected one of {self.head_list}."
+    def _connect(self) -> ClientConnection:
+        while True:
+            try:
+                return connect(
+                    self._uri,
+                    compression=None,
+                    max_size=None,
+                    # This connection carries large binary payloads and can pause
+                    # on human input or blocking inference, so keepalive causes
+                    # false positives with sync websockets.
+                    ping_interval=None,
                 )
-            address = "http://" + self.robot_ip + ":" + self.robot_port + "/message"
-            msg ={
-                "head":head,
-                "content":content,
-            }
-            resp = requests.post(
-                address,
-                json=msg,
-                timeout=3
-            )
-            reply = resp.json()
-            print(f"[interface client] 已发送给 robot /message: {head}")
-            
-            if reply is not None:
-                print(f"[interface client] 收到来自 robot 的回复: {head}")
-                return reply
-            else:
-                return None
+            except OSError:
+                time.sleep(1.0)
 
-        except ValueError as e:
-            print(f"[interface client] 参数错误: {e}")
-            return None
-        except requests.RequestException as e:
-            print(f"[interface client] 发送失败: {e}")
-            return None
+    def _expect_hello(self) -> None:
+        message = self._recv_message(timeout=10.0)
+        if message.get("type") != "hello":
+            raise RuntimeError(f"Unexpected initial robot bridge message: {message}")
+
+    def _send_message(self, message: dict[str, Any]) -> None:
+        self._ws.send(self._packer.pack(message))
+
+    def _recv_message(self, timeout: float | None = None) -> dict[str, Any]:
+        raw_message = self._ws.recv(timeout=timeout)
+        if isinstance(raw_message, str):
+            raise RuntimeError("Robot bridge expects binary websocket frames.")
+        return msgpack_numpy.unpackb(raw_message)
+
+    def send_config(self, config: dict[str, Any]) -> None:
+        self._send_message(
+            {
+                "type": "config",
+                "config": config,
+            }
+        )
+
+    def send_state(self, state: str) -> None:
+        self._send_message(
+            {
+                "type": "state",
+                "state": state,
+            }
+        )
+
+    def recv_obs(self, timeout: float | None = None) -> tuple[int, Any]:
+        message = self._recv_message(timeout=timeout)
+        if message.get("type") != "obs":
+            raise RuntimeError(f"Unexpected robot bridge message while waiting for obs: {message}")
+        return int(message["obs_seq"]), message["obs"]
+
+    def send_action(self, action: Any, obs_seq: int) -> None:
+        self._send_message(
+            {
+                "type": "action",
+                "obs_seq": int(obs_seq),
+                "action": action,
+            }
+        )
+
+    def close(self) -> None:
+        self._ws.close()

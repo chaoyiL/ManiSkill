@@ -1,6 +1,5 @@
 import sys
 import os
-from typing import Any
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 sys.path.append(ROOT_DIR)
@@ -25,48 +24,6 @@ from client.robot_client import RobotClient
 from utils.precise_sleep import precise_wait
 from real_world.bimanual_umi_env import BimanualUmiEnv
 from real_world.real_inference_util import get_real_umi_obs_dict, get_real_umi_action
-
-def convert_ndarray_to_list(obj: Any) -> Any:
-    """Recursively convert numpy arrays in obs dict to Python lists before sending."""
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, dict):
-        return {k: convert_ndarray_to_list(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [convert_ndarray_to_list(item) for item in obj]
-    return obj
-
-def convert_list_to_ndarray(obj: Any, key_path: str = "") -> Any:
-    """Recursively convert obs/action lists to ndarray with inference-safe dtypes."""
-    if isinstance(obj, dict):
-        return {
-            k: convert_list_to_ndarray(v, k if not key_path else f"{key_path}.{k}")
-            for k, v in obj.items()
-        }
-
-    if isinstance(obj, list):
-        converted = [convert_list_to_ndarray(item, key_path) for item in obj]
-
-        if key_path.startswith("observation.images."):
-            return np.asarray(converted, dtype=np.uint8)
-        if key_path == "observation.state":
-            return np.asarray(converted, dtype=np.float32)
-
-        arr = np.asarray(converted)
-        if arr.dtype == np.object_:
-            return arr
-        if np.issubdtype(arr.dtype, np.floating):
-            return arr.astype(np.float32, copy=False)
-        if np.issubdtype(arr.dtype, np.integer):
-            return arr.astype(np.int32, copy=False)
-        return arr
-
-    if isinstance(obj, tuple):
-        return tuple(convert_list_to_ndarray(item, key_path) for item in obj)
-
-    return obj
 
 class ObsSaver:
     """异步保存observation数据，不影响eval过程"""
@@ -213,12 +170,7 @@ class ObsSaver:
 @click.command()
 @click.option('--config', '-c', default=f'pi05_single', help='Config name for policy.')
 @click.option('--ckpt-dir', '-i', default='/home/rvsa/codehub/VB-VLA/checkpoints/block/140000', help='Path to checkpoint directory')
-@click.option('--data_type', '-dt', default='vision',help='vision, vitac, vitacpc')
-@click.option('--language_prompt', '-lp', default='Open the red pot, pick up the blue cylinder on the table and place it into the pot.', help='Language prompt')
-
-@click.option('--save_obs', '-so', default=True, help='Save observation data for verification (saves every step)')
-@click.option('--control_frequency', '-f', default=30, type=float, help="Control frequency in Hz.")
-@click.option('--controller_frequency', '-cf', default=40, type=float, help="Controller frequency in Hz.")
+@click.option('--save_obs', '-so', default=False, help='Save observation data for verification (saves every step)')
 @click.option('--cam_path', default=['/dev/video0', '/dev/video2'], type=list, help="-")
 
 @click.option('--quest_2_ee_left', default=None, help="-") # eye-hand transform matrix
@@ -231,18 +183,13 @@ class ObsSaver:
 @click.option('--obs_pose_repr', default='relative', help='obs pose representation')
 @click.option('--action_pose_repr', default='relative', help='action pose representation')
 
-@click.option('--single_arm_mode', default=True, help='single arm mode')
-@click.option('--no_state_obs_mode', default=False, help='no state obs mode')
-@click.option('--ip', default='127.0.0.1', help='ip of robot')
-@click.option('--port', default=8000, help='port of robot')
+@click.option('--ip', default='0.0.0.0', help='which ip the robot listening on')
+@click.option('--port', default=8000, help='port')
+@click.option('--cycle_timeout_warn_ms', default=2)
 
 def main(config,
     ckpt_dir,
-    data_type,
-    language_prompt,
     save_obs,
-    control_frequency, 
-    controller_frequency,
     cam_path,
     quest_2_ee_left,
     quest_2_ee_right,
@@ -251,10 +198,9 @@ def main(config,
     vel_max,
     obs_pose_repr,
     action_pose_repr,
-    single_arm_mode,
-    no_state_obs_mode,
     ip,
-    port
+    port,
+    cycle_timeout_warn_ms
     ):
     # Load default calibration matrices if not provided
     # quest_2_ee_left = np.eye(4)
@@ -271,21 +217,22 @@ def main(config,
     client = RobotClient(host=ip, port=port)
     client.start_background()
 
-    config_dict = None
-    while config_dict is None:
-        print("waiting for config...", flush=True)
-        config_dict = client.get_value("config")
-        time.sleep(1)
+    print("Waiting for policy client connection")
+    client.wait_for_connection()
 
-    data_type = config_dict.get("data_type", data_type)
-    language_prompt = config_dict.get("language_prompt", language_prompt)
-    control_frequency = config_dict.get("control_frequency", control_frequency)
-    controller_frequency = config_dict.get("controller_frequency", controller_frequency)
-    single_arm_mode = config_dict.get("single_arm_mode", single_arm_mode)
-    no_state_obs_mode = config_dict.get("no_state_obs_mode", no_state_obs_mode)
-    steps_per_inference = int(config_dict.get("steps_per_inference", 1))
+    print("Waiting for config", flush=True)
+    config_dict = client.wait_for_config()
+
+    data_type = config_dict["data_type"]
+    language_prompt = config_dict["language_prompt"]
+    control_frequency = float(config_dict["control_frequency"])
+    controller_frequency = float(config_dict["controller_frequency"])
+    single_arm_mode = config_dict["single_arm_mode"]
+    no_state_obs_mode = config_dict["no_state_obs_mode"]
+    steps_per_inference = int(config_dict["steps_per_inference"])
 
     dt = 1/control_frequency
+    cycle_timeout_warn_sec = cycle_timeout_warn_ms / 1000.0
     # ViTaC policy inputs are resized to 224x224 in model transforms.
     obs_res = (224, 224)
     if single_arm_mode:
@@ -305,6 +252,7 @@ def main(config,
     debug_info["time"] = []
 
     print("steps_per_inference:", steps_per_inference)
+    print("cycle_timeout_warn_ms:", cycle_timeout_warn_ms)
     # print("data_type:", data_type)
     print("jax backend:", jax.default_backend())
     print("jax devices:", jax.devices())
@@ -346,22 +294,26 @@ def main(config,
                 ], axis=-1)[-1]
                 episode_start_pose.append(pose)
                 
-            # 在获得开始指令之前，持续更新观察量
+            # 在开始前只推送一次 warmup obs，避免 client 等待人工输入时
+            # 持续堆积大图像帧把 websocket 写阻塞。
             state = None
+            warmup_obs_published = False
             while state != "start":
-                print("[main] waiting for state...")
-                obs_dict = get_real_umi_obs_dict(
-                    env_obs=obs, shape_meta=None,
-                    episode_start_pose=episode_start_pose,
-                    data_type=data_type,
-                    cam_path=cam_path,
-                    task=language_prompt,
-                    no_state_obs_mode=no_state_obs_mode
-                )
-                client.set_obs(convert_ndarray_to_list(obs_dict))
+                if not warmup_obs_published:
+                    obs = env.get_obs()
+                    obs_dict = get_real_umi_obs_dict(
+                        env_obs=obs, shape_meta=None,
+                        episode_start_pose=episode_start_pose,
+                        data_type=data_type,
+                        cam_path=cam_path,
+                        task=language_prompt,
+                        no_state_obs_mode=no_state_obs_mode
+                    )
+                    client.publish_obs(obs_dict)
+                    warmup_obs_published = True
 
-                state = client.get_value("state")
-                time.sleep(0.1)
+                state = client.get_state_update()
+                time.sleep(0.05)
 
             print('################################## Start! ##################################')
             
@@ -373,95 +325,111 @@ def main(config,
                 print(f"[ObsSaver] Observation saving enabled. Directory: {obs_saver.save_dir}")
             
             try:
-
-                counter = 0
+                start_delay = 1.0
+                t_start = time.monotonic() + start_delay
+                iter_idx = 0
+                last_status_log_time = time.monotonic()
 
                 while True:
-                    try:
-                        start_delay = 1.0
-                        t_start = time.monotonic() + start_delay
-                        print("Started!")
-                        iter_idx = 0
-
-                        while True:
-                            state = client.get_value("state")
-                            if state == "stop":
-                                break
-
-                            # 预先计算循环结束的时间点，用于后续的精确等待
-                            t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
-
-                            # 获取obs
-                            obs = env.get_obs()
-                            obs_timestamps = obs['timestamp']
-                            # print(f'[main] Obs latency {time.time() - obs_timestamps[-1]}')
-                            
-                            # 保存obs
-                            if obs_saver is not None:
-                                obs_saver.save_obs(obs, step_idx=iter_idx)
-
-                            # 在收到动作之前，持续设置obs
-                            raw_action = None
-                            while raw_action is None:
-                                print("[main] waiting for action...")
-                                obs_dict = get_real_umi_obs_dict(
-                                    env_obs=obs, shape_meta=None,
-                                    episode_start_pose=episode_start_pose,
-                                    data_type=data_type,
-                                    cam_path=cam_path,
-                                    task=language_prompt,
-                                    no_state_obs_mode=no_state_obs_mode
-                                )
-                                client.set_obs(convert_ndarray_to_list(obs_dict))
-
-                                raw_action = client.get_value("action")
-                                time.sleep(0.01)
-
-                            raw_action = convert_list_to_ndarray(raw_action)
-
-                            # 将输出的相对动作转换成绝对动作
-                            action = get_real_umi_action(raw_action, obs, action_pose_repr) # GET ABS ACTIONS
-                            this_target_poses = action
-                            assert this_target_poses.shape[1] == len(cam_path) * 7
-                            
-                            # 计算动作执行时间戳
-                            # 指定推理出来的每个动作该在什么时间点执行
-
-                            # HACK:补偿延迟时间
-                            latency_compensation = (time.time() - obs_timestamps[-1]) * 1.5
-                            print(f'[main] Latency compensation: {latency_compensation}')
-                            action_timestamps = (np.arange(len(action), dtype=np.float64)
-                                ) * dt + obs_timestamps[-1] + latency_compensation
-
-                            env.exec_actions(
-                                actions=this_target_poses,
-                                timestamps=action_timestamps
-                            )
-                            
-                            # print(f"[main] Submitted {len(this_target_poses)} steps of actions.")
-
-                            # renew debug info
-                            try:
-                                debug_info_new = env.get_debug_info()
-                                for key in debug_info_new:
-                                    debug_info[key] += list(debug_info_new[key])
-                                    if len(debug_info[key]) > 500:
-                                        debug_info[key] = debug_info[key][-500:]
-                            except Exception:
-                                pass
-
-                            counter += 1
-                            if counter > 1000:
-                                break
-
-                            precise_wait(t_cycle_end)
-                            iter_idx += steps_per_inference
-
-                    except KeyboardInterrupt:
-                        print("Interrupted!")
+                    t_cycle_actual_start = time.monotonic()
+                    state = client.get_state_update()
+                    if state == "stop":
                         break
 
+                    # 预先计算循环结束的时间点，用于后续的精确等待
+                    t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
+
+                    # 获取obs
+                    obs = env.get_obs()
+                    obs_timestamps = obs['timestamp']
+
+                    # 保存obs
+                    if obs_saver is not None:
+                        obs_saver.save_obs(obs, step_idx=iter_idx)
+
+                    obs_dict = get_real_umi_obs_dict(
+                        env_obs=obs, shape_meta=None,
+                        episode_start_pose=episode_start_pose,
+                        data_type=data_type,
+                        cam_path=cam_path,
+                        task=language_prompt,
+                        no_state_obs_mode=no_state_obs_mode
+                    )
+                    obs_seq = client.publish_obs(obs_dict)
+
+                    raw_action = None
+                    while raw_action is None:
+                        state = client.get_state_update()
+                        if state == "stop":
+                            break
+                        raw_action = client.wait_for_action(obs_seq=obs_seq, timeout=0.1)
+
+                    if state == "stop":
+                        break
+
+                    # 计算动作执行时间戳
+                    # 指定推理出来的每个动作该在什么时间点执行
+                    latency = time.time() - obs_timestamps[-1]
+                    action_timestamps = np.arange(len(raw_action), dtype=np.float64) * dt + obs_timestamps[-1]
+
+                    # 更新动作序列，确保全都是新动作
+                    curr_time = time.time()
+                    is_new = action_timestamps > curr_time
+                    new_raw_actions = raw_action[is_new]
+                    new_timestamps = action_timestamps[is_new]
+
+                    # 获取新位姿
+                    new_obs = env.get_obs()
+
+                    # 将输出的相对动作转换成绝对动作
+                    new_action = get_real_umi_action(new_raw_actions, new_obs, action_pose_repr)
+                    assert new_action.shape[1] == len(cam_path) * 7
+
+                    env.exec_actions(
+                        actions=new_action,
+                        timestamps=new_timestamps
+                    )
+
+                    now = time.monotonic()
+                    if now - last_status_log_time >= 2.0:
+                        print(
+                            f"[main] iter={iter_idx} obs_seq={obs_seq} "
+                            f"infer_latency_ms={latency * 1000.0:.1f} "
+                            f"accepted_actions={len(new_raw_actions)}/{len(raw_action)}"
+                        )
+                        last_status_log_time = now
+
+                    # renew debug info
+                    try:
+                        debug_info_new = env.get_debug_info()
+                        for key in debug_info_new:
+                            debug_info[key] += list(debug_info_new[key])
+                            if len(debug_info[key]) > 500:
+                                debug_info[key] = debug_info[key][-500:]
+                    except Exception:
+                        pass
+
+                    cycle_actual_end = time.monotonic()
+                    cycle_elapsed = cycle_actual_end - t_cycle_actual_start
+                    cycle_budget = steps_per_inference * dt
+                    cycle_deadline_miss = cycle_actual_end - t_cycle_end
+                    if cycle_deadline_miss > cycle_timeout_warn_sec:
+                        print(
+                            f"[main] WARNING: Control loop overrun at iter {iter_idx}: "
+                            f"elapsed={cycle_elapsed * 1000.0:.1f} ms, "
+                            f"budget={cycle_budget * 1000.0:.1f} ms, "
+                            f"deadline_miss={cycle_deadline_miss * 1000.0:.1f} ms"
+                        )
+
+                    precise_wait(t_cycle_end)
+                    iter_idx += steps_per_inference
+
+            except KeyboardInterrupt:
+                print("Interrupted!")
+
             finally:
+                client.stop()
+                client.join(timeout=1.0)
                 # stop obs saver
                 if obs_saver is not None:
                     obs_saver.stop()

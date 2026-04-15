@@ -11,7 +11,7 @@ from multiprocessing.managers import SharedMemoryManager
 from real_world.robot_api.arm.Controller import Controller
 from real_world.multi_uvc_camera import MultiUvcCamera, VideoRecorder
 
-from policy.common.cv2_util import get_image_transform
+from utils.common.cv2_util import get_image_transform
 
 from utils.interpolation_util import get_interp1d, PoseInterpolator
 from utils.pose_util import pose_to_mat, mat_to_pose, pose_to_pos_quat, pos_quat_to_pose
@@ -193,7 +193,15 @@ class BimanualUmiEnv:
         self.camera_obs_horizon = camera_obs_horizon
         self.robot_obs_horizon = robot_obs_horizon
         self.gripper_obs_horizon = gripper_obs_horizon
-    
+        self._last_log_time = {}
+
+    def _rate_limited_log(self, key: str, message: str, interval_sec: float = 2.0) -> None:
+        now = time.monotonic()
+        last_log_time = self._last_log_time.get(key, 0.0)
+        if now - last_log_time >= interval_sec:
+            print(message)
+            self._last_log_time[key] = now
+
     # ======== start-stop API =============
     #### 待修改
     @property
@@ -247,7 +255,6 @@ class BimanualUmiEnv:
         k = math.ceil(
             self.camera_obs_horizon * self.camera_down_sample_steps \
             * (20 / self.control_frequency)) + 2 # here 2 is adjustable, typically 1 should be enough
-        print("k:", k)
         # print('==>k  ', k, self.camera_obs_horizon, self.camera_down_sample_steps, self.control_frequency)
 
         'camera obs'
@@ -390,73 +397,76 @@ class BimanualUmiEnv:
         if not isinstance(timestamps, np.ndarray):
             timestamps = np.array(timestamps)
 
-        # 更新动作序列，确保全都是新动作
-        receive_time = time.time()
-        is_new = timestamps > receive_time
-        new_actions = actions[is_new]
-        new_timestamps = timestamps[is_new]
+        # # 更新动作序列，确保全都是新动作
+        # receive_time = time.time()
+        # is_new = timestamps > receive_time
+        # new_actions = actions[is_new]
+        # new_timestamps = timestamps[is_new]
 
-        print(f"[env] exec {len(new_actions)}/{len(actions)} actions")
+        # print(f"[env] exec {len(new_actions)}/{len(actions)} actions")
         # print("[env] receive_time:", int(receive_time * 1000) % 1000)
         # print("[env] new_timestamps:")
         # print([int(new_timestamps[i] * 1000) % 1000 for i in range(len(new_timestamps))])
 
-        for i in range(len(new_actions)):
-            index_left = 0
-            index_right = 1
+        if len(actions) != 0:
+            for i in range(len(actions)):
+                index_left = 0
+                index_right = 1
 
-            quest_left_action = new_actions[i, 7 * index_left + 0: 7 * index_left + 6]
-            gripper_left_action = new_actions[i, 7 * index_left + 6]
-            # convert quest pose to ee pose
-            target_ee_pose_left = mat_to_pose(pose_to_mat(quest_left_action) @ (np.linalg.inv(self.quest_2_ee_left)))
-            # convert actual gripper width to commanded gripper width
-            commanded_gripper_width_left = [(gripper_left_action - self.width_offset) / self.width_slope]
-            if not self.single_arm_mode:
-                quest_right_action = new_actions[i, 7 * index_right + 0: 7 * index_right + 6]
-                gripper_right_action = new_actions[i, 7 * index_right + 6]
-                target_ee_pose_right = mat_to_pose(pose_to_mat(quest_right_action) @ (np.linalg.inv(self.quest_2_ee_right)))
-                commanded_gripper_width_right = [(gripper_right_action - self.width_offset) / self.width_slope]
-            else:
-                target_ee_pose_right = None
-                commanded_gripper_width_right = None
+                quest_left_action = actions[i, 7 * index_left + 0: 7 * index_left + 6]
+                gripper_left_action = actions[i, 7 * index_left + 6]
+                # convert quest pose to ee pose
+                target_ee_pose_left = mat_to_pose(pose_to_mat(quest_left_action) @ (np.linalg.inv(self.quest_2_ee_left)))
+                # convert actual gripper width to commanded gripper width
+                commanded_gripper_width_left = [(gripper_left_action - self.width_offset) / self.width_slope]
+                if not self.single_arm_mode:
+                    quest_right_action = actions[i, 7 * index_right + 0: 7 * index_right + 6]
+                    gripper_right_action = actions[i, 7 * index_right + 6]
+                    target_ee_pose_right = mat_to_pose(pose_to_mat(quest_right_action) @ (np.linalg.inv(self.quest_2_ee_right)))
+                    commanded_gripper_width_right = [(gripper_right_action - self.width_offset) / self.width_slope]
+                else:
+                    target_ee_pose_right = None
+                    commanded_gripper_width_right = None
 
-            # DEBUG: 在这里检查 quest 相对 当前动作 的 dist
-            # 使用 get_obs 获取机械臂当前位姿
-            # curr_obs = self.get_obs()
-            # curr_pos_left = curr_obs['robot0_eef_pos'][-1]
-            # curr_rot_left = curr_obs['robot0_eef_rot_axis_angle'][-1]
-            # curr_pos_right = curr_obs['robot1_eef_pos'][-1]
-            # curr_rot_right = curr_obs['robot1_eef_rot_axis_angle'][-1]
-            # curr_pose_left_mat = pose_to_mat(np.concatenate([curr_pos_left, curr_rot_left], axis=-1))
-            # curr_pose_right_mat = pose_to_mat(np.concatenate([curr_pos_right, curr_rot_right], axis=-1))
-            # 获取相对位姿
-            # quest_left_action_mat = pose_to_mat(quest_left_action)
-            # quest_right_action_mat = pose_to_mat(quest_right_action)
-            # quest_left_action_rel_mat = np.linalg.inv(curr_pose_left_mat) @ quest_left_action_mat
-            # quest_right_action_rel_mat = np.linalg.inv(curr_pose_right_mat) @ quest_right_action_mat
-            # # 计算并输出Quest坐标系下的相对位姿
-            # dist_left = np.linalg.norm(quest_left_action_rel_mat[:3, 3])
-            # dist_right = np.linalg.norm(quest_right_action_rel_mat[:3, 3])
-            # print(f"[env] #{i} action dist_left: {dist_left}, dist_right: {dist_right}")
+                # DEBUG: 在这里检查 quest 相对 当前动作 的 dist
+                # 使用 get_obs 获取机械臂当前位姿
+                # curr_obs = self.get_obs()
+                # curr_pos_left = curr_obs['robot0_eef_pos'][-1]
+                # curr_rot_left = curr_obs['robot0_eef_rot_axis_angle'][-1]
+                # curr_pos_right = curr_obs['robot1_eef_pos'][-1]
+                # curr_rot_right = curr_obs['robot1_eef_rot_axis_angle'][-1]
+                # curr_pose_left_mat = pose_to_mat(np.concatenate([curr_pos_left, curr_rot_left], axis=-1))
+                # curr_pose_right_mat = pose_to_mat(np.concatenate([curr_pos_right, curr_rot_right], axis=-1))
+                # 获取相对位姿
+                # quest_left_action_mat = pose_to_mat(quest_left_action)
+                # quest_right_action_mat = pose_to_mat(quest_right_action)
+                # quest_left_action_rel_mat = np.linalg.inv(curr_pose_left_mat) @ quest_left_action_mat
+                # quest_right_action_rel_mat = np.linalg.inv(curr_pose_right_mat) @ quest_right_action_mat
+                # # 计算并输出Quest坐标系下的相对位姿
+                # dist_left = np.linalg.norm(quest_left_action_rel_mat[:3, 3])
+                # dist_right = np.linalg.norm(quest_right_action_rel_mat[:3, 3])
+                # print(f"[env] #{i} action dist_left: {dist_left}, dist_right: {dist_right}")
 
-            # HACK: 将 target_ee_pose_left 改为左手在curr_pose的基础上增加x，右手不动
-            # curr_ee_pose_left_mat = curr_pose_left_mat @ (np.linalg.inv(self.quest_2_ee_left))
-            # curr_ee_pose_right_mat = curr_pose_right_mat @ (np.linalg.inv(self.quest_2_ee_right))
-            # target_ee_pose_left = mat_to_pose(curr_ee_pose_left_mat)
-            # target_ee_pose_left[0] += 0.005
-            # target_ee_pose_right = mat_to_pose(curr_ee_pose_right_mat)
+                # HACK: 将 target_ee_pose_left 改为左手在curr_pose的基础上增加x，右手不动
+                # curr_ee_pose_left_mat = curr_pose_left_mat @ (np.linalg.inv(self.quest_2_ee_left))
+                # curr_ee_pose_right_mat = curr_pose_right_mat @ (np.linalg.inv(self.quest_2_ee_right))
+                # target_ee_pose_left = mat_to_pose(curr_ee_pose_left_mat)
+                # target_ee_pose_left[0] += 0.005
+                # target_ee_pose_right = mat_to_pose(curr_ee_pose_right_mat)
 
-            # 把目标动作序列 依次 发送给控制器
-            if new_timestamps[i] < time.time():
-                print("[env] action is too late")
-            else:
-                self.controller.schedule_waypoint(
-                    pose_left=target_ee_pose_left,
-                    gripper_left=commanded_gripper_width_left,
-                    pose_right=target_ee_pose_right,
-                    gripper_right=commanded_gripper_width_right,
-                    target_time=new_timestamps[i]
-                )
+                # 把目标动作序列 依次 发送给控制器
+                if timestamps[i] < time.time():
+                    self._rate_limited_log("late_action", "[env] action is too late")
+                else:
+                    self.controller.schedule_waypoint(
+                        pose_left=target_ee_pose_left,
+                        gripper_left=commanded_gripper_width_left,
+                        pose_right=target_ee_pose_right,
+                        gripper_right=commanded_gripper_width_right,
+                            target_time=timestamps[i]
+                    )
+        else:
+            self._rate_limited_log("no_action", "[env] no action received")
     
     def get_debug_info(self):
         return self.controller.get_debug_info()

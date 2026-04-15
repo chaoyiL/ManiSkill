@@ -7,8 +7,8 @@ import multiprocessing as mp
 from threadpoolctl import threadpool_limits
 from multiprocessing.managers import SharedMemoryManager
 from utils.timestamp_accumulator import get_accumulate_timestamp_idxs
-from policy.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
-from policy.shared_memory.shared_memory_queue import SharedMemoryQueue, Full, Empty
+from utils.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
+from utils.shared_memory.shared_memory_queue import SharedMemoryQueue, Full, Empty
 from real_world.video_recorder import VideoRecorder
 from utils.camera_device import V4L2Camera
 

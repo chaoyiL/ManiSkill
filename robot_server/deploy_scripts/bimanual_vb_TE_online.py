@@ -1,7 +1,6 @@
 from math import ceil
 import sys
 import os
-from typing import Any
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 sys.path.append(ROOT_DIR)
@@ -26,51 +25,6 @@ from client.robot_client import RobotClient
 from utils.precise_sleep import precise_wait
 from real_world.bimanual_umi_env import BimanualUmiEnv
 from real_world.real_inference_util import get_real_umi_obs_dict, get_real_umi_action
-
-def convert_ndarray_to_list(obj: Any) -> Any:
-    """Recursively convert numpy arrays in obs dict to Python lists before sending."""
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, np.generic):
-        return obj.item()
-    if isinstance(obj, dict):
-        return {k: convert_ndarray_to_list(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [convert_ndarray_to_list(item) for item in obj]
-    return obj
-
-def convert_list_to_ndarray(obj: Any, key_path: str = "") -> Any:
-    """Recursively convert obs_dict lists to ndarray with inference-safe dtypes."""
-    if isinstance(obj, dict):
-        return {
-            k: convert_list_to_ndarray(v, k if not key_path else f"{key_path}.{k}")
-            for k, v in obj.items()
-        }
-
-    if isinstance(obj, list):
-        converted = [convert_list_to_ndarray(item, key_path) for item in obj]
-
-        # Keep image payload as uint8 so Observation.from_dict can normalize to [-1, 1].
-        if key_path.startswith("observation.images."):
-            return np.asarray(converted, dtype=np.uint8)
-
-        # Robot state is expected as float.
-        if key_path == "observation.state":
-            return np.asarray(converted, dtype=np.float32)
-
-        arr = np.asarray(converted)
-        if arr.dtype == np.object_:
-            return arr
-        if np.issubdtype(arr.dtype, np.floating):
-            return arr.astype(np.float32, copy=False)
-        if np.issubdtype(arr.dtype, np.integer):
-            return arr.astype(np.int32, copy=False)
-        return arr
-
-    if isinstance(obj, tuple):
-        return tuple(convert_list_to_ndarray(item, key_path) for item in obj)
-
-    return obj
 
 class ObsSaver:
     """异步保存observation数据，不影响eval过程"""
@@ -218,7 +172,7 @@ class ObsSaver:
 @click.command()
 # send: data type, language_prompt, control_frequency, controller_frequency, 
 # single_arm_mode, no_state_obs_mode, steps_per_inference, action_horizon
-@click.option('--save_obs', '-so', default=True, help='Save observation data for verification (saves every step)')
+@click.option('--save_obs', '-so', default=False, help='Save observation data for verification (saves every step)')
 @click.option('--cam_path', default=['/dev/video0', '/dev/video2'], type=list, help="-")
 @click.option('--width_slope', default=2.041300, type=float, help="-") # transform between gripper width and commanded width
 @click.option('--width_offset', default=0.110115, type=float, help="-") # transform between gripper width and commanded width
@@ -247,11 +201,11 @@ def main(
     client = RobotClient(host=ip, port=port)
     client.start_background()
 
-    config_dict = None
-    while config_dict is None:
-        print("waiting for config...", flush=True)
-        config_dict = client.get_value("config")
-        time.sleep(1)
+    print("Waiting for policy client connection")
+    client.wait_for_connection()
+
+    print("Waiting for config", flush=True)
+    config_dict = client.wait_for_config()
 
     
     data_type = config_dict["data_type"]
@@ -323,24 +277,28 @@ def main(
                 ], axis=-1)[-1]
                 episode_start_pose.append(pose)
             
-            # 在获得开始指令之前，持续更新观察量
+            # 在开始前只推送一次 warmup obs，避免 client 等待人工输入时
+            # 持续堆积大图像帧把 websocket 写阻塞。
             state = None
+            warmup_obs_published = False
             while state != "start":
-                print("[main] waiting for state...")
-                obs_dict = get_real_umi_obs_dict(
-                env_obs=obs, shape_meta=None,
-                episode_start_pose=episode_start_pose,
-                # 由于现在的obs horizon=1，不需要使用批量转化函数，故这个参数实际并未使用
-                # obs_pose_repr=obs_pose_repr,
-                data_type=data_type,
-                cam_path=cam_path,
-                task=language_prompt,
-                no_state_obs_mode=no_state_obs_mode
-                )
-                client.set_obs(convert_ndarray_to_list(obs_dict))
+                if not warmup_obs_published:
+                    obs = env.get_obs()
+                    obs_dict = get_real_umi_obs_dict(
+                    env_obs=obs, shape_meta=None,
+                    episode_start_pose=episode_start_pose,
+                    # 由于现在的obs horizon=1，不需要使用批量转化函数，故这个参数实际并未使用
+                    # obs_pose_repr=obs_pose_repr,
+                    data_type=data_type,
+                    cam_path=cam_path,
+                    task=language_prompt,
+                    no_state_obs_mode=no_state_obs_mode
+                    )
+                    client.publish_obs(obs_dict)
+                    warmup_obs_published = True
 
-                state = client.get_value("state")
-                time.sleep(0.1)
+                state = client.get_state_update()
+                time.sleep(0.05)
 
             print('################################## Start! ##################################')
 
@@ -352,137 +310,110 @@ def main(
                 print(f"[ObsSaver] Observation saving enabled. Directory: {obs_saver.save_dir}")
 
             try:
-
-                counter = 0
                 # 构建action temporal ensembling矩阵
                 action_te_mat = np.zeros((action_horizon, action_horizon, len(cam_path) * 7))
                 # 预计算权重（不变，无需每帧重算）
                 weights = np.arange(action_horizon, 0, -1, dtype=np.float64)
                 weights /= weights.sum()
                 weights = weights.reshape(1, action_horizon)
+                start_delay = 1.0
+                t_start = time.monotonic() + start_delay
+                iter_idx = 0
+                last_status_log_time = time.monotonic()
 
                 while True:
-                    try:
-                        start_delay = 1.0
-                        t_start = time.monotonic() + start_delay
-                        print("Started!")
-                        iter_idx = 0
-
-                        while True:
-                            # 检查状态，若为stop就退出
-                            state = client.get_value("state")
-                            if state == "stop":
-                                break
-
-                            # 预先计算循环结束的时间点，用于后续的精确等待
-                            t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt # steps_per_inference=1，特别注意
-
-                            # 获取obs
-                            obs = env.get_obs()
-                            obs_timestamps = obs['timestamp']
-                            # print(f'[main] Obs latency {time.time() - obs_timestamps[-1]}')
-
-                            # 保存obs
-                            if obs_saver != None:
-                                obs_saver.save_obs(obs, step_idx=iter_idx)
-
-                            obs_dict = get_real_umi_obs_dict(
-                                env_obs=obs, shape_meta=None,
-                                obs_pose_repr=obs_pose_repr,
-                                episode_start_pose=episode_start_pose,
-                                data_type=data_type,
-                                cam_path=cam_path,
-                                task=language_prompt,
-                                no_state_obs_mode=no_state_obs_mode
-                                ) # 获取最新一帧的obs_dict
-
-                            # 在收到动作之前，持续设置obs
-                            raw_action = None
-                            while raw_action is None:
-                                print("[main] waiting for action...")
-                                obs_dict = get_real_umi_obs_dict(
-                                env_obs=obs, shape_meta=None,
-                                episode_start_pose=episode_start_pose,
-                                # 由于现在的obs horizon=1，不需要使用批量转化函数，故这个参数实际并未使用
-                                # obs_pose_repr=obs_pose_repr,
-                                data_type=data_type,
-                                cam_path=cam_path,
-                                task=language_prompt,
-                                no_state_obs_mode=no_state_obs_mode
-                                )
-                                client.set_obs(convert_ndarray_to_list(obs_dict))
-
-                                raw_action = client.get_value("action")
-                                time.sleep(0.01)
-
-                            raw_action = convert_list_to_ndarray(raw_action)
-
-                            # 将输出的相对动作转换成绝对动作
-                            action = get_real_umi_action(raw_action, obs, action_pose_repr) # ABS ACTIONS
-                            assert action.shape[1] == len(cam_path) * 7
-
-                            # 填充action_te_mat
-                            # 对角线移位：mat[n,m] = old_mat[n-1,m-1]，首行首列清零
-                            # 等价于原来的双重 Python 循环，但全程 numpy，快约 action_horizon² 倍
-                            action_te_mat[1:, 1:, :] = action_te_mat[:-1, :-1, :].copy()
-                            action_te_mat[0, :, :] = 0
-                            action_te_mat[:, 0, :] = 0
-                            # 第一行始终是最新生成的动作序列，时间从左向右 **递减**，最右边的一列是与obs时间相对应的action
-                            # 因此需要将action序列的顺序反转
-                            action_te_mat[0, :, :] = action[::-1, :]
-
-                            # 目标动作为矩阵最右侧一列的加权平均
-                            this_target_poses = np.dot(weights, action_te_mat[:, -1, :]).reshape(1, len(cam_path) * 7)
-                            # print("this_target_poses:", this_target_poses)
-
-                            # 计算动作执行时间戳
-                            # 指定推理出来的每个动作该在什么时间点执行
-
-                            # 补偿推理耗时
-                            inference_latency = time.time() - obs_timestamps[-1]
-                            latency_compensation = inference_latency * 1.5
-                            print("[main] inference latency:", inference_latency)
-                            action_timestamps = (np.arange(action_horizon, dtype=np.float64)
-                                ) * dt + obs_timestamps[-1] + latency_compensation
-                            # this_target_action_timestamps = action_timestamps[action_horizon-1:action_horizon]
-                            this_target_action_timestamps = action_timestamps[0:1]
-
-                            # warmup 检查：iter_idx >= action_horizon-1 等价于原来的 matrix_rank 判断
-                            # （每轮对角线移位后，第 k 轮时恰好有 k+1 行被填满，rank==action_horizon 需要 action_horizon 轮）
-                            if iter_idx >= action_horizon - 1:
-                                print("exec_actions:", time.time())
-                                env.exec_actions(
-                                        actions=this_target_poses,
-                                        timestamps=this_target_action_timestamps
-                                    )
-                                print(f"Submitted {len(this_target_poses)} steps of actions.")
-                            else:
-                                print("No actions to execute.")
-
-                            precise_wait(t_cycle_end)
-                            iter_idx += steps_per_inference
-
-                            # renew debug info
-                            try:
-                                debug_info_new = env.get_debug_info()
-                                for key in debug_info_new:
-                                    debug_info[key] += list(debug_info_new[key])
-                                    if len(debug_info[key]) > 500:
-                                        debug_info[key] = debug_info[key][-500:]
-                            except Exception:
-                                pass
-
-                            counter += 1
-                            if counter > 100000:
-                                break
-
-                    except KeyboardInterrupt:
-                        print("Interrupted!")
+                    state = client.get_state_update()
+                    if state == "stop":
                         break
 
+                    # 预先计算循环结束的时间点，用于后续的精确等待
+                    t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
+
+                    # 获取obs
+                    obs = env.get_obs()
+                    obs_timestamps = obs['timestamp']
+
+                    # 保存obs
+                    if obs_saver is not None:
+                        obs_saver.save_obs(obs, step_idx=iter_idx)
+
+                    obs_dict = get_real_umi_obs_dict(
+                        env_obs=obs, shape_meta=None,
+                        obs_pose_repr=obs_pose_repr,
+                        episode_start_pose=episode_start_pose,
+                        data_type=data_type,
+                        cam_path=cam_path,
+                        task=language_prompt,
+                        no_state_obs_mode=no_state_obs_mode
+                    )
+                    obs_seq = client.publish_obs(obs_dict)
+
+                    raw_action = None
+                    while raw_action is None:
+                        state = client.get_state_update()
+                        if state == "stop":
+                            break
+                        raw_action = client.wait_for_action(obs_seq=obs_seq, timeout=0.1)
+
+                    if state == "stop":
+                        break
+
+                    # 将输出的相对动作转换成绝对动作
+                    action = get_real_umi_action(raw_action, obs, action_pose_repr)
+                    assert action.shape[1] == len(cam_path) * 7
+
+                    # 填充action_te_mat
+                    action_te_mat[1:, 1:, :] = action_te_mat[:-1, :-1, :].copy()
+                    action_te_mat[0, :, :] = 0
+                    action_te_mat[:, 0, :] = 0
+                    action_te_mat[0, :, :] = action[::-1, :]
+
+                    # 目标动作为矩阵最右侧一列的加权平均
+                    this_target_poses = np.dot(weights, action_te_mat[:, -1, :]).reshape(1, len(cam_path) * 7)
+
+                    # 补偿推理耗时
+                    inference_latency = time.time() - obs_timestamps[-1]
+                    latency_compensation = inference_latency * 1.5
+                    action_timestamps = np.arange(action_horizon, dtype=np.float64) * dt + obs_timestamps[-1] + latency_compensation
+                    this_target_action_timestamps = action_timestamps[0:1]
+
+                    # warmup 检查：iter_idx >= action_horizon-1 等价于原来的 matrix_rank 判断
+                    if iter_idx >= action_horizon - 1:
+                        env.exec_actions(
+                            actions=this_target_poses,
+                            timestamps=this_target_action_timestamps
+                        )
+
+                    now = time.monotonic()
+                    if now - last_status_log_time >= 2.0:
+                        print(
+                            f"[main] iter={iter_idx} obs_seq={obs_seq} "
+                            f"infer_latency_ms={inference_latency * 1000.0:.1f} "
+                            f"te_ready={iter_idx >= action_horizon - 1}"
+                        )
+                        last_status_log_time = now
+
+                    precise_wait(t_cycle_end)
+                    iter_idx += steps_per_inference
+
+                    # renew debug info
+                    try:
+                        debug_info_new = env.get_debug_info()
+                        for key in debug_info_new:
+                            debug_info[key] += list(debug_info_new[key])
+                            if len(debug_info[key]) > 500:
+                                debug_info[key] = debug_info[key][-500:]
+                    except Exception:
+                        pass
+
+            except KeyboardInterrupt:
+                print("Interrupted!")
+
             finally:
+                client.stop()
+                client.join(timeout=1.0)
                 # stop obs saver
-                if obs_saver != None:
+                if obs_saver is not None:
                     obs_saver.stop()
 
                 # draw DEBUG INFO

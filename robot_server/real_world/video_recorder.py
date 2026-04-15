@@ -5,7 +5,7 @@ import time
 import enum
 import multiprocessing as mp
 from multiprocessing.managers import SharedMemoryManager
-from policy.shared_memory.shared_memory_queue import SharedMemoryQueue, Full, Empty
+from utils.shared_memory.shared_memory_queue import SharedMemoryQueue, Full, Empty
 from utils.timestamp_accumulator import get_accumulate_timestamp_idxs
 
 
