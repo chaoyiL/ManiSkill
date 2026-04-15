@@ -19,3 +19,4 @@ ENV/
 # Large local artifacts
 user_client/checkpoint/
 robot_server/eval_obs_data/
+robot_server/ee_action_logs/
