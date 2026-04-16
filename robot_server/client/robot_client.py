@@ -7,15 +7,23 @@ from typing import Any
 
 from openpi_client import msgpack_numpy
 from websockets.exceptions import ConnectionClosed
+from websockets.datastructures import Headers
+from websockets.http11 import Request, Response
 from websockets.sync.server import Server, ServerConnection, serve
 
 
 class RobotClient:
     """Persistent websocket bridge between robot-side control and remote policy."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8000):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        allowed_tokens: list[str] | tuple[str, ...] | set[str] | None = None,
+    ):
         self.host = host
         self.port = port
+        self._allowed_tokens = None if allowed_tokens is None else {str(token) for token in allowed_tokens}
 
         self._condition = threading.Condition()
         self._packer = msgpack_numpy.Packer()
@@ -32,6 +40,32 @@ class RobotClient:
 
         self._latest_action: Any = None
         self._latest_action_obs_seq = -1
+
+    def _process_request(self, connection: ServerConnection, request: Request) -> Response | None:
+        del connection
+
+        if self._allowed_tokens is None:
+            return None
+
+        auth_header = request.headers.get("Authorization")
+        if auth_header is None:
+            return Response(
+                401,
+                "Unauthorized",
+                Headers({"WWW-Authenticate": 'Bearer realm="robot-bridge"'}),
+                b"Missing Authorization header.\n",
+            )
+
+        scheme, _, token = auth_header.partition(" ")
+        if scheme.lower() != "bearer" or not token or token not in self._allowed_tokens:
+            return Response(
+                401,
+                "Unauthorized",
+                Headers({"WWW-Authenticate": 'Bearer realm="robot-bridge"'}),
+                b"Invalid bearer token.\n",
+            )
+
+        return None
 
     def _handle_connection(self, websocket: ServerConnection) -> None:
         with self._condition:
@@ -102,6 +136,7 @@ class RobotClient:
             self._handle_connection,
             host=self.host,
             port=self.port,
+            process_request=self._process_request,
             compression=None,
             max_size=None,
             # This bridge can legitimately spend long periods inside blocking

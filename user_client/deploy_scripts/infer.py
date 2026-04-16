@@ -185,6 +185,7 @@ class ObsSaver:
 
 @click.option('--ip', default='127.0.0.1', help='which ip the messages are sent to')
 @click.option('--port', default='8000', help='port')
+@click.option('--token', default='111', help='your test token')
 
 def main(config,
     ckpt_dir,
@@ -196,7 +197,8 @@ def main(config,
     single_arm_mode,
     no_state_obs_mode,
     ip,
-    port
+    port,
+    token
     ):
     
     train_config = _config.get_config(config)
@@ -208,7 +210,7 @@ def main(config,
     action_horizon = int(train_config.model.action_horizon)
     steps_per_inference = action_horizon
 
-    client = InterfaceClient(ip, port)
+    client = InterfaceClient(ip, port, token=token)
 
     config_dict = {
         "data_type" : data_type,
@@ -218,7 +220,7 @@ def main(config,
         "single_arm_mode" : single_arm_mode,
         "no_state_obs_mode" : no_state_obs_mode,
         "steps_per_inference" : steps_per_inference,
-        "action_horizon" : action_horizon
+        "action_horizon" : action_horizon,
     }
 
     client.send_config(config_dict)

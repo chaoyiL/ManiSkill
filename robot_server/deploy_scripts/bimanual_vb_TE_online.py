@@ -26,6 +26,31 @@ from utils.precise_sleep import precise_wait
 from real_world.bimanual_umi_env import BimanualUmiEnv
 from real_world.real_inference_util import get_real_umi_obs_dict, get_real_umi_action
 
+DEFAULT_TOKEN_LIST_PATH = Path(ROOT_DIR) / "assets" / "token_list.txt"
+
+
+def load_token_list(token_file: str) -> list[str]:
+    token_path = Path(token_file)
+    if not token_path.is_absolute():
+        token_path = (Path(ROOT_DIR) / token_path).resolve()
+
+    if not token_path.exists():
+        raise click.ClickException(f"Token list file not found: {token_path}")
+
+    token_list = []
+    with token_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            token = line.strip()
+            if not token or token.startswith("#"):
+                continue
+            token_list.append(token)
+
+    if not token_list:
+        raise click.ClickException(f"No valid tokens found in {token_path}")
+
+    return token_list
+
+
 class ObsSaver:
     """异步保存observation数据，不影响eval过程"""
 
@@ -180,8 +205,9 @@ class ObsSaver:
 @click.option('--obs_pose_repr', default='relative', help='obs pose representation')
 @click.option('--action_pose_repr', default='relative', help='action pose representation')
 
-@click.option('--ip', default='127.0.0.1', help='ip of robot')
+@click.option('--ip', default='0.0.0.0', help='ip of robot')
 @click.option('--port', default=8000, help='port of robot')
+@click.option('--token-file', default=str(DEFAULT_TOKEN_LIST_PATH), help='path to the allowed token list file')
 
 def main(
     save_obs,
@@ -192,13 +218,16 @@ def main(
     obs_pose_repr,
     action_pose_repr,
     ip,
-    port
+    port,
+    token_file,
     ):
 
     quest_2_ee_left = np.load("/home/rvsa/codehub/VB-VLA/quest_2_ee_left_hand_fix_quest.npy")
     quest_2_ee_right = np.load("/home/rvsa/codehub/VB-VLA/quest_2_ee_right_hand_fix_quest.npy")
 
-    client = RobotClient(host=ip, port=port)
+    token_list = load_token_list(token_file)
+
+    client = RobotClient(host=ip, port=port, allowed_tokens=token_list)
     client.start_background()
 
     print("Waiting for policy client connection")
@@ -378,11 +407,11 @@ def main(
                     this_target_action_timestamps = action_timestamps[0:1]
 
                     # warmup 检查：iter_idx >= action_horizon-1 等价于原来的 matrix_rank 判断
-                    if iter_idx >= action_horizon - 1:
-                        env.exec_actions(
-                            actions=this_target_poses,
-                            timestamps=this_target_action_timestamps
-                        )
+                    # if iter_idx >= action_horizon - 1:
+                    #     env.exec_actions(
+                    #         actions=this_target_poses,
+                    #         timestamps=this_target_action_timestamps
+                    #     )
 
                     now = time.monotonic()
                     if now - last_status_log_time >= 2.0:

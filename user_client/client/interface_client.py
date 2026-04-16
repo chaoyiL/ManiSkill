@@ -4,16 +4,18 @@ import time
 from typing import Any
 
 from openpi_client import msgpack_numpy
+from websockets.exceptions import InvalidStatus
 from websockets.sync.client import ClientConnection, connect
 
 
 class InterfaceClient:
     """Persistent websocket client for remote robot interaction."""
 
-    def __init__(self, ip: str = "127.0.0.1", port: str | int = "8000"):
+    def __init__(self, ip: str = "127.0.0.1", port: str | int = "8000", token: str | None = None):
         self.robot_ip = ip
         self.robot_port = int(port)
         self._uri = f"ws://{self.robot_ip}:{self.robot_port}"
+        self._token = None if token is None else str(token)
         self._packer = msgpack_numpy.Packer()
         self._ws = self._connect()
         self._expect_hello()
@@ -23,6 +25,7 @@ class InterfaceClient:
             try:
                 return connect(
                     self._uri,
+                    additional_headers=self._build_headers(),
                     compression=None,
                     max_size=None,
                     # This connection carries large binary payloads and can pause
@@ -32,6 +35,16 @@ class InterfaceClient:
                 )
             except OSError:
                 time.sleep(1.0)
+            except InvalidStatus as exc:
+                raise RuntimeError(
+                    f"Robot websocket handshake rejected with status {exc.response.status_code}. "
+                    "Check the client token."
+                ) from exc
+
+    def _build_headers(self) -> dict[str, str] | None:
+        if self._token is None:
+            return None
+        return {"Authorization": f"Bearer {self._token}"}
 
     def _expect_hello(self) -> None:
         message = self._recv_message(timeout=10.0)

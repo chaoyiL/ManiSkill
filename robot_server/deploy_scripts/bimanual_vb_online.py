@@ -25,6 +25,31 @@ from utils.precise_sleep import precise_wait
 from real_world.bimanual_umi_env import BimanualUmiEnv
 from real_world.real_inference_util import get_real_umi_obs_dict, get_real_umi_action
 
+DEFAULT_TOKEN_LIST_PATH = Path(ROOT_DIR) / "assets" / "token_list.txt"
+
+
+def load_token_list(token_file: str) -> list[str]:
+    token_path = Path(token_file)
+    if not token_path.is_absolute():
+        token_path = (Path(ROOT_DIR) / token_path).resolve()
+
+    if not token_path.exists():
+        raise click.ClickException(f"Token list file not found: {token_path}")
+
+    token_list = []
+    with token_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            token = line.strip()
+            if not token or token.startswith("#"):
+                continue
+            token_list.append(token)
+
+    if not token_list:
+        raise click.ClickException(f"No valid tokens found in {token_path}")
+
+    return token_list
+
+
 class ObsSaver:
     """异步保存observation数据，不影响eval过程"""
     
@@ -185,6 +210,7 @@ class ObsSaver:
 
 @click.option('--ip', default='0.0.0.0', help='which ip the robot listening on')
 @click.option('--port', default=8000, help='port')
+@click.option('--token-file', default=str(DEFAULT_TOKEN_LIST_PATH), help='path to the allowed token list file')
 @click.option('--cycle_timeout_warn_ms', default=2)
 
 def main(config,
@@ -200,7 +226,8 @@ def main(config,
     action_pose_repr,
     ip,
     port,
-    cycle_timeout_warn_ms
+    token_file,
+    cycle_timeout_warn_ms,
     ):
     # Load default calibration matrices if not provided
     # quest_2_ee_left = np.eye(4)
@@ -214,7 +241,9 @@ def main(config,
     # Keep these options for backward compatibility, but use remote config in online mode.
     del config, ckpt_dir
 
-    client = RobotClient(host=ip, port=port)
+    token_list = load_token_list(token_file)
+
+    client = RobotClient(host=ip, port=port, allowed_tokens=token_list)
     client.start_background()
 
     print("Waiting for policy client connection")
@@ -385,10 +414,10 @@ def main(config,
                     new_action = get_real_umi_action(new_raw_actions, new_obs, action_pose_repr)
                     assert new_action.shape[1] == len(cam_path) * 7
 
-                    env.exec_actions(
-                        actions=new_action,
-                        timestamps=new_timestamps
-                    )
+                    # env.exec_actions(
+                    #     actions=new_action,
+                    #     timestamps=new_timestamps
+                    # )
 
                     now = time.monotonic()
                     if now - last_status_log_time >= 2.0:
