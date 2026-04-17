@@ -22,8 +22,8 @@ except ImportError:
     print("安装命令: pip install datasets")
     sys.exit(1)
 
-from replay_buffer import ReplayBuffer
-from viz_3d_enhanced import Enhanced3DVisualizer
+from user_client.robot_visualization.src.replay_buffer import ReplayBuffer
+from user_client.robot_visualization.src.viz_3d_enhanced import Enhanced3DVisualizer
 
 
 class LeRobotReplayBufferAdapter:
